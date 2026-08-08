@@ -5,12 +5,12 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class StrictModel(BaseModel):
     # TODO 1: reject unexpected fields instead of silently ignoring them.
-    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
 class Operation(StrEnum):
@@ -78,6 +78,15 @@ class RefundInput(StrictModel):
     amount: Decimal = Field(gt=0, le=Decimal("5000"), max_digits=10, decimal_places=2)
     reason: str = Field(min_length=8, max_length=240)
     # STRETCH: reject control-like instructions inside the business reason.
+
+    @field_validator("reason")
+    @classmethod
+    def reject_control_like_instructions(cls, v: str) -> str:
+        normalized = v.lower().strip()
+        blocked_words = ["ignore previous", "system override", "bypass policy"]
+        if any(word in normalized for word in blocked_words):
+            raise ValueError("Control-like instructions are not allowed in the reason")
+        return v
 
 
 class RefundOutput(StrictModel):
