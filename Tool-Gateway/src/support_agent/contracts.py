@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class StrictModel(BaseModel):
-    # TODO 1: reject unexpected fields instead of silently ignoring them.
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
@@ -77,16 +76,15 @@ class RefundInput(StrictModel):
     order_id: str = Field(pattern=r"^ord_[A-Za-z0-9]+$")
     amount: Decimal = Field(gt=0, le=Decimal("5000"), max_digits=10, decimal_places=2)
     reason: str = Field(min_length=8, max_length=240)
-    # STRETCH: reject control-like instructions inside the business reason.
 
     @field_validator("reason")
     @classmethod
-    def reject_control_like_instructions(cls, v: str) -> str:
-        normalized = v.lower().strip()
-        blocked_words = ["ignore previous", "system override", "bypass policy"]
-        if any(word in normalized for word in blocked_words):
-            raise ValueError("Control-like instructions are not allowed in the reason")
-        return v
+    def reject_control_language(cls, value: str) -> str:
+        normalized = value.lower()
+        blocked = ("ignore previous", "system override", "bypass policy")
+        if any(marker in normalized for marker in blocked):
+            raise ValueError("reason contains control-like instructions")
+        return value
 
 
 class RefundOutput(StrictModel):
