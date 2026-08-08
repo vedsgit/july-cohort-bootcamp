@@ -105,9 +105,9 @@ def build_graph(*, gateway: ToolGateway, proposer: Proposer, narrator: Narrator)
         }
 
     def after_enforce(state: AgentState) -> Literal["await_approval", "narrate"]:
-        # TODO 7: route approval_required (with no approval yet) to await_approval.
-        # Otherwise continue to narrate.
-        del state
+        result = state.get("gateway_result") or {}
+        if result.get("status") == "approval_required" and not state.get("approval"):
+            return "await_approval"
         return "narrate"
 
     builder = StateGraph(AgentState)
