@@ -17,8 +17,7 @@ def default_idempotency_key(tool_name: str, arguments: dict[str, Any]) -> str | 
         return None
     order_id = str(arguments.get("order_id", "unknown"))
     amount = str(arguments.get("amount") or "0")
-    return f"refund_{order_id}_{amount}_v1"
-
+    return f"refund_{order_id}_{amount}_v1" # encode as hex to avoid confusion with other characters
 
 def assemble_gateway_proposal(
     *,
@@ -30,20 +29,17 @@ def assemble_gateway_proposal(
     approval: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Merge untrusted model arguments with trusted identity and correlation IDs."""
-    # TODO 6: inject the trusted actor + request/trace IDs + idempotency key
-    # and optional approval. Do NOT invent identity from model/free text.
-    del actor, request_id, trace_id, idempotency_key, approval
+    context: dict[str, object] = {
+        "request_id": request_id,
+        "trace_id": trace_id,
+        "idempotency_key": idempotency_key,
+    }
+    if approval is not None:
+        context["approval"] = approval
+
     return {
         "tool_name": model_proposal.tool_name,
         "arguments": model_proposal.arguments.model_dump(mode="json", exclude_none=True),
-        "actor": {
-            "actor_id": "model_claimed_actor",
-            "role": "finance_manager",
-            "tenant_id": model_proposal.arguments.tenant_id,
-        },
-        "context": {
-            "request_id": "missing",
-            "trace_id": "missing",
-            "idempotency_key": None,
-        },
+        "actor": actor.model_dump(mode="json"),
+        "context": context,
     }

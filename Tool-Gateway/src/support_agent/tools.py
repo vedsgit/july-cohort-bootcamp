@@ -5,11 +5,16 @@ import os
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
 from .contracts import OrderStatusInput, RefundInput
 from .errors import ToolBoundaryError
+
+
+@dataclass(frozen=True)
+class StoredRefund:
+    fingerprint: str
+    result: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -36,11 +41,18 @@ def default_idempotency_store_path() -> Path:
 
 
 class SupportToolBackend:
+    """
+    Deterministic fake backend used for live teaching and tests.
+
+    Refund idempotency is remembered in a JSON file by default (classroom stand-in
+    for a unique constraint / idempotency table in a real database).
+    """
+
     def __init__(
         self,
         *,
         seeded_orders: tuple[SeededOrder, ...] | None = None,
-        idempotency_store_path: str | Path | None | Any = ...,
+        idempotency_store_path: str | Path | None = ...,  # type: ignore[assignment]
     ) -> None:
         if idempotency_store_path is ...:
             self.idempotency_store_path: Path | None = default_idempotency_store_path()
@@ -49,8 +61,7 @@ class SupportToolBackend:
         else:
             self.idempotency_store_path = Path(idempotency_store_path)
 
-        # Key → prior successful refund. Persist via _load_store / _save_store (TODO 3).
-        self.refund_by_key: dict[str, dict[str, object]] = {}
+        self.refund_by_key: dict[str, StoredRefund] = {}
         self.refund_side_effect_count = 0
         orders = seeded_orders if seeded_orders is not None else DEFAULT_SEEDED_ORDERS
         self.orders: dict[tuple[str, str], SeededOrder] = {
@@ -77,18 +88,35 @@ class SupportToolBackend:
     def issue_refund(
         self, request: RefundInput, idempotency_key: str | None
     ) -> dict[str, object]:
-        # TODO 3: make repeated execution return the original result.
-        # Use idempotency_key + self.refund_by_key, then call self._save_store().
-        # In prod this map is a DB/Redis unique constraint — here it's a JSON file.
-        del idempotency_key
+        if not idempotency_key:
+            raise ToolBoundaryError(
+                "idempotency_required",
+                "idempotency key is required for refund writes",
+            )
+
+        fingerprint = self._fingerprint(request)
+        existing = self.refund_by_key.get(idempotency_key)
+        if existing is not None:
+            if existing.fingerprint != fingerprint:
+                raise ToolBoundaryError(
+                    "idempotency_conflict",
+                    "idempotency key was reused with different arguments",
+                )
+            return dict(existing.result)
+
         result: dict[str, object] = {
             "refund_id": f"ref_{uuid4().hex[:10]}",
             "order_id": request.order_id,
             "amount": request.amount,
             "status": "accepted",
         }
+        self.refund_by_key[idempotency_key] = StoredRefund(
+            fingerprint=fingerprint,
+            result=result,
+        )
         self.refund_side_effect_count += 1
-        return result
+        self._save_store()
+        return dict(result)
 
     def _load_store(self) -> None:
         path = self.idempotency_store_path
@@ -99,15 +127,22 @@ class SupportToolBackend:
         except (OSError, json.JSONDecodeError):
             return
         refunds = payload.get("refunds", {})
-        if isinstance(refunds, dict):
-            self.refund_by_key = {
-                str(key): value
-                for key, value in refunds.items()
-                if isinstance(value, dict)
-            }
+        if not isinstance(refunds, dict):
+            return
+        loaded: dict[str, StoredRefund] = {}
+        for key, item in refunds.items():
+            if not isinstance(item, dict):
+                continue
+            fingerprint = item.get("fingerprint")
+            result = item.get("result")
+            if isinstance(fingerprint, str) and isinstance(result, dict):
+                loaded[str(key)] = StoredRefund(fingerprint=fingerprint, result=result)
+        self.refund_by_key = loaded
         count = payload.get("side_effect_count")
         if isinstance(count, int) and count >= 0:
             self.refund_side_effect_count = count
+        else:
+            self.refund_side_effect_count = len(loaded)
 
     def _save_store(self) -> None:
         path = self.idempotency_store_path
@@ -116,7 +151,13 @@ class SupportToolBackend:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "side_effect_count": self.refund_side_effect_count,
-            "refunds": self.refund_by_key,
+            "refunds": {
+                key: {
+                    "fingerprint": stored.fingerprint,
+                    "result": stored.result,
+                }
+                for key, stored in self.refund_by_key.items()
+            },
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(
@@ -124,3 +165,11 @@ class SupportToolBackend:
             encoding="utf-8",
         )
         tmp.replace(path)
+
+    @staticmethod
+    def _fingerprint(request: RefundInput) -> str:
+        payload = request.model_dump(mode="json")
+        return "|".join(
+            f"{key}={payload[key]}"
+            for key in ("tenant_id", "order_id", "amount", "reason")
+        )

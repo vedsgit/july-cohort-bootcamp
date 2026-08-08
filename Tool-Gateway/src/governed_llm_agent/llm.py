@@ -45,7 +45,7 @@ class OpenAIProposer:
             SystemMessage(content=PROPOSAL_SYSTEM_PROMPT),
             HumanMessage(content=f"Operator request:\n{user_text}"),
         ]
-        result = self._structured.invoke(messages)
+        result = self._structured.invoke(messages) # LLM Call to generate a proposal
         if isinstance(result, ModelToolProposal):
             return result
         return ModelToolProposal.model_validate(result)
@@ -73,7 +73,7 @@ class OpenAINarrator:
                 )
             ),
         ]
-        result = self._structured.invoke(messages)
+        result = self._structured.invoke(messages) # LLM call
         if isinstance(result, OutcomeNarration):
             return result.message
         return OutcomeNarration.model_validate(result).message
