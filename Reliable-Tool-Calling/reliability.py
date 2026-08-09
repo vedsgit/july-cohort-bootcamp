@@ -165,14 +165,31 @@ class CircuitBreaker:
 
 
 class FixedWindowRateLimiter:
-    def __init__(self, limit=5, window_seconds=60.0, *, clock=time.monotonic, trace=None):
-        self.limit, self.window_seconds, self.clock = limit, window_seconds, clock
+    def __init__(
+        self,
+        limit: int = 5,
+        window_seconds: float = 60.0,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        trace: Trace | None = None,
+    ) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.clock = clock
         self.trace = trace or Trace()
-        self._windows = {}
+        self._windows: dict[str, tuple[float, int]] = {}
 
-    def check(self, key):
-        # TODO 6: enforce a per-key fixed window and emit trace events.
-        raise NotImplementedError
+    def check(self, key: str) -> None:
+        now = self.clock()
+        started_at, count = self._windows.get(key, (now, 0))
+        if now - started_at >= self.window_seconds:
+            started_at, count = now, 0
+        if count >= self.limit:
+            self.trace.emit("rate_limit.rejected", key=key, limit=self.limit)
+            raise RateLimitError()
+        self._windows[key] = (started_at, count + 1)
+        self.trace.emit("rate_limit.allowed", key=key, remaining=self.limit - count - 1)
+
 
 
 @dataclass(frozen=True)
@@ -188,9 +205,31 @@ class SearchAdapter(Protocol):
     def search(self, query: str) -> Any: ...
 
 
-def validate_search_result(payload, *, source, degraded):
-    # TODO 7: validate required fields and return SearchResult.
-    raise NotImplementedError
+def validate_search_result(payload: Any, *, source: str, degraded: bool) -> SearchResult:
+    if not isinstance(payload, dict):
+        raise ContractError("response must be an object")
+    query = payload.get("query")
+    answer = payload.get("answer")
+    if not isinstance(query, str) or not query.strip():
+        raise ContractError("query must be a non-empty string")
+    if not isinstance(answer, str) or not answer.strip():
+        raise ContractError("answer must be a non-empty string")
+
+    citations: list[str] = []
+    results = payload.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict) and isinstance(item.get("url"), str) and item["url"]:
+                citations.append(item["url"])
+
+    return SearchResult(
+        query=query.strip(),
+        answer=answer.strip(),
+        source=source,
+        degraded=degraded,
+        citations=tuple(citations),
+    )
+
 
 
 class ScriptedAdapter:
@@ -210,11 +249,52 @@ class ScriptedAdapter:
 
 
 class ReliableSearchGateway:
-    def __init__(self, mcp_adapter, direct_adapter, *, retry_policy, breaker, limiter, trace, sleep=time.sleep):
-        self.mcp_adapter, self.direct_adapter = mcp_adapter, direct_adapter
-        self.retry_policy, self.breaker, self.limiter = retry_policy, breaker, limiter
-        self.trace, self.sleep, self._cache = trace, sleep, {}
+    def __init__(
+        self,
+        mcp_adapter: SearchAdapter,
+        direct_adapter: SearchAdapter,
+        *,
+        retry_policy: RetryPolicy,
+        breaker: CircuitBreaker,
+        limiter: FixedWindowRateLimiter,
+        trace: Trace,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.mcp_adapter = mcp_adapter
+        self.direct_adapter = direct_adapter
+        self.retry_policy = retry_policy
+        self.breaker = breaker
+        self.limiter = limiter
+        self.trace = trace
+        self.sleep = sleep
+        self._cache: dict[tuple[str, str], SearchResult] = {}
 
-    def search(self, query, *, tenant, request_id):
-        # TODO 8: rate limit, idempotency, retry + breaker, safe fallback, validation.
-        raise NotImplementedError
+    def search(self, query: str, *, tenant: str, request_id: str) -> SearchResult:
+        self.limiter.check(tenant)
+        cache_key = (tenant, request_id)
+        if cache_key in self._cache:
+            self.trace.emit("idempotency.hit", tenant=tenant, request_id=request_id)
+            return self._cache[cache_key]
+
+        def call_mcp() -> Any:
+            return retry_call(
+                lambda: self.mcp_adapter.search(query),
+                self.retry_policy,
+                trace=self.trace,
+                sleep=self.sleep,
+            )
+
+        try:
+            payload = self.breaker.execute(call_mcp)
+            result = validate_search_result(payload, source="mcp", degraded=False)
+        except IntegrationError as error:
+            if not error.retryable:
+                self.trace.emit("gateway.fail_fast", code=error.code)
+                raise
+            self.trace.emit("fallback.started", reason=error.code)
+            fallback_payload = self.direct_adapter.search(query)
+            result = validate_search_result(fallback_payload, source="direct", degraded=True)
+            self.trace.emit("fallback.succeeded", source="direct")
+
+        self._cache[cache_key] = result
+        return result
