@@ -72,36 +72,88 @@ class RetryPolicy:
         return max(0, raw - spread + (2*spread*random_value()))
 
 
-def retry_call(operation, policy, *, trace, sleep=time.sleep):
-    # TODO 2: bounded attempts, error classification, backoff, and trace events.
-    raise NotImplementedError
+def retry_call(
+    operation: Callable[[], Any],
+    policy: RetryPolicy,
+    *,
+    trace: Trace,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    if policy.max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    for attempt in range(1, policy.max_attempts + 1):
+        trace.emit("retry.attempt", attempt=attempt)
+        try:
+            result = operation()
+            trace.emit("retry.success", attempt=attempt)
+            return result
+        except IntegrationError as error:
+            trace.emit(
+                "retry.failure",
+                attempt=attempt,
+                code=error.code,
+                retryable=error.retryable,
+            )
+            if not error.retryable or attempt == policy.max_attempts:
+                raise
+            delay = policy.delay_for_attempt(attempt)
+            trace.emit("retry.backoff", attempt=attempt, seconds=delay)
+            sleep(delay)
+
+    raise AssertionError("retry loop terminated unexpectedly")
+
 
 
 class CircuitBreaker:
-    CLOSED, OPEN, HALF_OPEN = "closed", "open", "half_open"
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
-    def __init__(self, failure_threshold=3, recovery_timeout=5.0, *, clock=time.monotonic, trace=None):
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        recovery_timeout: float = 5.0,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        trace: Trace | None = None,
+    ) -> None:
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.clock = clock
         self.trace = trace or Trace()
         self.state = self.CLOSED
         self.consecutive_failures = 0
+        self.opened_at: float | None = None
+
+    def _transition(self, state: str) -> None:
+        previous = self.state
+        self.state = state
+        self.trace.emit("circuit.transition", previous=previous, current=state)
+
+    def before_call(self) -> None:
+        if self.state == self.OPEN:
+            assert self.opened_at is not None
+            if self.clock() - self.opened_at >= self.recovery_timeout:
+                self._transition(self.HALF_OPEN)
+            else:
+                self.trace.emit("circuit.rejected", state=self.state)
+                raise CircuitOpenError()
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
         self.opened_at = None
+        if self.state != self.CLOSED:
+            self._transition(self.CLOSED)
 
-    def before_call(self):
-        # TODO 3: reject OPEN or transition to HALF_OPEN after timeout.
-        raise NotImplementedError
+    def record_failure(self) -> None:
+        self.consecutive_failures += 1
+        if self.state == self.HALF_OPEN or self.consecutive_failures >= self.failure_threshold:
+            self.opened_at = self.clock()
+            if self.state != self.OPEN:
+                self._transition(self.OPEN)
 
-    def record_success(self):
-        # TODO 4: reset and close.
-        raise NotImplementedError
-
-    def record_failure(self):
-        # TODO 5: count failures and open/reopen when required.
-        raise NotImplementedError
-
-    def execute(self, operation):
+    def execute(self, operation: Callable[[], Any]) -> Any:
         self.before_call()
         try:
             result = operation()
