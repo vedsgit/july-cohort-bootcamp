@@ -30,7 +30,7 @@ Pytest needs the launcher. It briefly stops and restores this kit's order agent.
 ```bash
 python -m demo.cli card hello
 python -m demo.cli hello --name Nachiketh
-python -m demo.cli hello --name Terence --raw
+python -m demo.cli hello --name Nachiketh --raw
 ```
 
 ## Skills
